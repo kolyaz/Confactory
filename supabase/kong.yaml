@@ -1,0 +1,119 @@
+_format_version: "3.0"
+_transform: true
+
+#######################################################################
+#  KONG DECLARATIVE CONFIG FOR SELF-HOSTED SUPABASE (PRODUCTION)
+#######################################################################
+
+services:
+
+  ###################################################################
+  # AUTH SERVICE (GoTrue)
+  ###################################################################
+  - name: auth
+    url: http://supabase-auth:9999/auth/v1
+    routes:
+      - name: auth-route
+        paths:
+          - /auth
+        strip_path: false
+
+  ###################################################################
+  # REST API (PostgREST)
+  ###################################################################
+  - name: rest
+    url: http://supabase-rest:3000
+    routes:
+      - name: rest-route
+        paths:
+          - /rest/v1
+        strip_path: false
+
+  ###################################################################
+  # GRAPHQL API (via PostgREST GraphQL mode)
+  ###################################################################
+  - name: graphql
+    url: http://supabase-rest:3000/graphql/v1
+    routes:
+      - name: graphql-route
+        paths:
+          - /graphql/v1
+        strip_path: false
+
+  ###################################################################
+  # STORAGE API
+  ###################################################################
+  - name: storage
+    url: http://supabase-storage:5000
+    routes:
+      - name: storage-route
+        paths:
+          - /storage/v1
+        strip_path: false
+
+  ###################################################################
+  # REALTIME API (WebSocket)
+  ###################################################################
+  - name: realtime
+    url: http://supabase-realtime:4000/socket
+    routes:
+      - name: realtime-route
+        paths:
+          - /realtime/v1
+        strip_path: false
+
+  ###################################################################
+  # EDGE FUNCTIONS RUNTIME
+  ###################################################################
+  - name: edge
+    url: http://supabase-edge-runtime:9001
+    routes:
+      - name: edge-route
+        paths:
+          - /functions
+        strip_path: false
+
+#######################################################################
+# GLOBAL PLUGINS
+#######################################################################
+
+plugins:
+  ###################################################################
+  # JWT Auth plugin (Supabase custom)
+  # Validates tokens issued by the project (anon + service_role)
+  ###################################################################
+  - name: supabase-jwt
+    config:
+      jwt_secret: ${SUPABASE_JWT_SECRET}
+      claims_namespace: ""
+      roles_claim: "role"
+      # allow ANON and SERVICE_ROLE tokens
+      allowed_roles:
+        - anon
+        - authenticated
+        - service_role
+
+  ###################################################################
+  # CORS — required for public APIs
+  ###################################################################
+  - name: cors
+    config:
+      origins:
+        - "*"
+      methods:
+        - GET
+        - POST
+        - PUT
+        - PATCH
+        - DELETE
+        - OPTIONS
+      headers:
+        - Authorization
+        - Content-Type
+        - apikey
+      exposed_headers:
+        - Authorization
+        - apikey
+      credentials: false
+      max_age: 3600
+      preflight_continue: false

@@ -1,0 +1,319 @@
+version: "3.9"
+
+########################################################
+# Production-ready docker-compose for self-hosted Supabase
+# - Single definitions (no duplicates)
+# - Traefik handles 80/443 and routing to services
+# - Supavisor provides pooling; postgres NOT exposed on 5432 to host
+# - Services reference env vars from .env
+########################################################
+
+x-common-variables: &common-env
+  # Internal service URLS (use internal docker hostnames)
+  SUPABASE_URL: http://supabase-kong:8000
+  SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+  SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+  N8N_HOST: ${DOMAIN}
+  N8N_PROTOCOL: https
+  WEBHOOK_URL: https://${DOMAIN}/webhook
+  # Supabase-specific
+  JWT_SECRET: ${SUPABASE_JWT_SECRET}
+  PGRST_DB_SCHEMAS: public,graphql,storage
+  PGRST_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+  DASHBOARD_USERNAME: ${DASHBOARD_USERNAME}
+  DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  SUPABASE_SECRET_KEY_BASE: ${SUPABASE_SECRET_KEY_BASE}
+  DBNAME: postgres
+  DB_USER: postgres
+  DB_PASSWORD: ${POSTGRES_PASSWORD}
+  DB_PORT: 5432
+  LOGFLARE_API_KEY: ${LOGFLARE_API_KEY}
+  IMGPROXY_URL: http://supabase-imgproxy:5001
+  METADATA_SECRET: ${METADATA_SECRET}
+  SUPAVISOR_HOST: supavisor
+  SUPAVISOR_PORT: ${SUPAVISOR_PORT:-6543}
+  SUPAVISOR_DB_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supavisor:${SUPAVISOR_PORT}/postgres
+
+services:
+  # -------------------------
+  # Traefik (reverse proxy + Let's Encrypt)
+  # -------------------------
+  traefik:
+    image: traefik:v3.0
+    restart: unless-stopped
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      - --entrypoints.web.http.redirections.entryPoint.to=websecure
+      - --entrypoints.web.http.redirections.entryPoint.scheme=https
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-certs:/letsencrypt
+    labels:
+      - traefik.enable=true
+
+  # -------------------------
+  # PostgreSQL (primary) - not exposed to host
+  # -------------------------
+  supabase-db:
+    image: supabase/postgres:15.1.1.79
+    restart: unless-stopped
+    environment:
+      PGUSER: supabase_admin
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: postgres
+      PGHOST: supabase-db
+      DATABASE_URL: postgresql://supabase_admin:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+    volumes:
+      - supabase-db-data:/var/lib/postgresql/data
+      - ./supabase/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U supabase_admin -h 127.0.0.1 -p 5432"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------
+  # Supavisor - connection pooler (maps host port only if you want)
+  # -------------------------
+  supavisor:
+    image: supabase/supavisor:latest
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD}@supabase-db:5432/postgres
+      POOLER_PORT: ${SUPAVISOR_PORT:-6543}
+      DEFAULT_POOL_MODE: ${SUPAVISOR_MODE:-transaction}
+      DEFAULT_POOL_SIZE: ${SUPAVISOR_POOL_SIZE:-30}
+      EXTERNAL_ID_ENABLED: true
+      LOG_LEVEL: info
+      PROMETHEUS_ENABLED: true
+      PROMETHEUS_PORT: 9497
+    ports:
+      - "${SUPAVISOR_PORT:-6543}:6543"   # only this port to be used by other services
+      - "9497:9497"                     # metrics (optional)
+    depends_on:
+      - supabase-db
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 6543"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - supavisor-config:/etc/supavisor
+
+  # -------------------------
+  # Kong (API gateway for Supabase)
+  # -------------------------
+  supabase-kong:
+    image: kong:3.4
+    restart: unless-stopped
+    environment:
+      KONG_DATABASE: "off"
+      KONG_PLUGINS: bundled,supabase-jwt
+      KONG_LOG_LEVEL: info
+    volumes:
+      - ./supabase/kong.yml:/etc/kong/kong.yml:ro
+    ports:
+      - "8000:8000"  # internal api proxy (Traefik will route via DOMAIN)
+      - "8001:8001"
+    depends_on:
+      - supavisor
+      - supabase-db
+
+  # -------------------------
+  # Auth (GoTrue)
+  # -------------------------
+  supabase-auth:
+    image: supabase/gotrue:v2.153.0
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      API_EXTERNAL_URL: https://${DOMAIN}/auth/v1
+      GOTRUE_API_HOST: 0.0.0.0
+      GOTRUE_DB_DRIVER: postgres
+      GOTRUE_DB_DATABASE_URL: ${SUPAVISOR_DB_URL}?external_id=auth
+      GOTRUE_SITE_URL: https://${DOMAIN}
+      GOTRUE_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      GOTRUE_JWT_EXP: 3600
+      GOTRUE_EXTERNAL_EMAIL_ENABLED: true
+      GOTRUE_SMTP_HOST: ${SMTP_HOST}
+      GOTRUE_SMTP_PORT: ${SMTP_PORT}
+      GOTRUE_SMTP_USER: ${SMTP_USER}
+      GOTRUE_SMTP_PASS: ${SMTP_PASS}
+      GOTRUE_SMTP_ADMIN_EMAIL: ${SMTP_ADMIN_EMAIL}
+      GOTRUE_MAILER_URLPATHS_CONFIRMATION: /auth/v1/verify
+    depends_on:
+      - supavisor
+      - supabase-db
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase-auth.rule=Host(`${DOMAIN}`) && PathPrefix(`/auth`)
+      - traefik.http.routers.supabase-auth.entrypoints=websecure
+      - traefik.http.services.supabase-auth.loadbalancer.server.port=9999
+
+  # -------------------------
+  # PostgREST (REST API)
+  # -------------------------
+  supabase-rest:
+    image: supabase/postgrest:v12.0.1
+    restart: unless-stopped
+    environment:
+      PGRST_DB_URI: ${SUPAVISOR_DB_URL}?external_id=rest
+      PGRST_DB_SCHEMAS: public,graphql,storage
+      PGRST_DB_ANON_ROLE: anon
+      PGRST_JWT_SECRET: ${SUPABASE_JWT_SECRET}
+    depends_on:
+      - supavisor
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase-rest.rule=Host(`${DOMAIN}`) && PathPrefix(`/rest/v1`)
+      - traefik.http.routers.supabase-rest.entrypoints=websecure
+      - traefik.http.services.supabase-rest.loadbalancer.server.port=3000
+
+  # -------------------------
+  # Realtime
+  # -------------------------
+  supabase-realtime:
+    image: supabase/realtime:v2.30.10
+    restart: unless-stopped
+    environment:
+      DB_HOST: supavisor
+      DB_PORT: ${SUPAVISOR_PORT:-6543}
+      DB_USER: supabase_realtime_admin
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: postgres
+      DB_OPTS: sslmode=disable&external_id=realtime_tenant
+      JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      SUPABASE_SECRET_KEY_BASE: ${SUPABASE_SECRET_KEY_BASE}
+      HOSTNAME: 0.0.0.0
+      PORT: 4000
+      DB_MAX_CONNS: 20
+    depends_on:
+      - supavisor
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase-realtime.rule=Host(`${DOMAIN}`) && PathPrefix(`/realtime`)
+      - traefik.http.routers.supabase-realtime.entrypoints=websecure
+      - traefik.http.services.supabase-realtime.loadbalancer.server.port=4000
+
+  # -------------------------
+  # Storage
+  # -------------------------
+  supabase-storage:
+    image: supabase/storage-api:v0.46.0
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      DATABASE_URL: ${SUPAVISOR_DB_URL}?external_id=storage
+      ANON_KEY: ${SUPABASE_ANON_KEY}
+      SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      STORAGE_BACKEND: local
+      STORAGE_LOCAL_PATH: /storage
+    volumes:
+      - supabase-storage:/storage
+    depends_on:
+      - supavisor
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase-storage.rule=Host(`${DOMAIN}`) && PathPrefix(`/storage`)
+      - traefik.http.routers.supabase-storage.entrypoints=websecure
+      - traefik.http.services.supabase-storage.loadbalancer.server.port=5000
+
+  # -------------------------
+  # ImgProxy
+  # -------------------------
+  supabase-imgproxy:
+    image: supabase/imgproxy:v3.8.0
+    restart: unless-stopped
+    environment:
+      IMGPROXY_BIND: :5001
+      IMGPROXY_LOCAL_FILESYSTEM_ROOT: /storage
+      IMGPROXY_USE_S3: "false"
+      IMGPROXY_USE_GCS: "false"
+      IMGPROXY_KEY: ${IMGPROXY_KEY}
+      IMGPROXY_SALT: ${IMGPROXY_SALT}
+    volumes:
+      - supabase-storage:/storage
+    depends_on:
+      - supavisor
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase-imgproxy.rule=Host(`${DOMAIN}`) && PathPrefix(`/img`)
+      - traefik.http.routers.supabase-imgproxy.entrypoints=websecure
+      - traefik.http.services.supabase-imgproxy.loadbalancer.server.port=5001
+
+  # -------------------------
+  # Supabase Studio (admin GUI)
+  # -------------------------
+  supabase-studio:
+    image: supabase/studio:latest
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      SUPABASE_URL: http://supabase-kong:8000
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      SUPABASE_PUBLIC_URL: https://${DOMAIN}
+      STUDIO_PG_META_URL: http://supabase-meta:8080
+      NEXT_PUBLIC_ENABLE_RLS: "true"
+      SUPABASE_REALTIME_URL: ws://supabase-realtime:4000/socket
+      SUPABASE_DB_URL: ${SUPAVISOR_DB_URL}
+    depends_on:
+      - supavisor
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.supabase-studio.rule=Host(`${DOMAIN}`) && PathPrefix(`/studio`)
+      - traefik.http.routers.supabase-studio.entrypoints=websecure
+      - traefik.http.services.supabase-studio.loadbalancer.server.port=3000
+
+  # -------------------------
+  # Edge runtime (Deno)
+  # -------------------------
+  supabase-edge-runtime:
+    image: supabase/edge-runtime:latest
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      SUPABASE_URL: ${SUPABASE_URL}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY}
+      JWT_SECRET: ${SUPABASE_JWT_SECRET}
+      DATABASE_URL: ${SUPAVISOR_DB_URL}?external_id=edge
+      DENO_DEPLOYMENT_ID: local
+      DENO_REGION: us-east-1
+    volumes:
+      - ./functions:/usr/local/lib/edge-runtime/services:ro
+    command: ["start", "--main-service", "/usr/local/lib/edge-runtime/services", "-p", "9001"]
+    ports:
+      - "9001:9001"
+    depends_on:
+      - supavisor
+      - supabase-auth
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9001/_health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.edge-runtime.rule=Host(`${DOMAIN}`) && PathPrefix(`/functions`)
+      - traefik.http.routers.edge-runtime.entrypoints=websecure
+      - traefik.http.services.edge-runtime.loadbalancer.server.port=9001
+
+volumes:
+  supabase-db-data:
+  supabase-shadow-data:
+  supabase-storage:
+  traefik-certs:
+  supavisor-config:
+
